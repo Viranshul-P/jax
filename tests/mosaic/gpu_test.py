@@ -1677,6 +1677,82 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
     )(x)
     np.testing.assert_array_equal(x, y)
 
+  @parameterized.named_parameters(
+      ("512_cols", 512, False, False),
+      ("544_cols", 544, True, False),
+      ("576_cols", 576, True, False),
+      ("512_cols_collective", 512, False, True),
+      ("576_cols_collective", 576, True, True),
+  )
+  def test_tmem_alloc_is_exclusive_only_above_512_cols(
+      self, num_cols, exclusive, collective
+  ):
+    self.skip_unless_sm107f()
+
+    def kernel(ctx, input, output, tmem):
+      del ctx
+      tmem.store(
+          fa.FragmentedArray.load_untiled(
+              input, layout=tcgen05.LAYOUT, optimized=False
+          )
+      )
+      tcgen05.commit_tmem()
+      tmem.load(tcgen05.LAYOUT).store_untiled(output, optimized=False)
+
+    dtype = jnp.float32
+    x = self.prng.uniform(-1, 1, (128, num_cols)).astype(dtype)
+    num_ctas = 2 if collective else 1
+    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as get_ptx:
+      y = mgpu.as_gpu_kernel(
+          kernel,
+          grid=(num_ctas, 1, 1),
+          block=(128, 1, 1),
+          in_shape=x,
+          out_shape=x,
+          smem_scratch_shape=mgpu.TMEM(x.shape, dtype, collective=collective),
+          cluster=(num_ctas, 1, 1),
+      )(x)
+    np.testing.assert_array_equal(x, y)
+    ptx = get_ptx()
+    expected = (".exclusive" if exclusive else "", str(num_ctas))
+    [alloc] = re.findall(
+        r"tcgen05\.alloc(\.exclusive)?\.cta_group::([12])\.", ptx
+    )
+    self.assertEqual(alloc, expected)
+    [dealloc] = re.findall(
+        r"tcgen05\.dealloc(\.exclusive)?\.cta_group::([12])\.", ptx
+    )
+    self.assertEqual(dealloc, expected)
+
+  @parameterized.named_parameters(
+      ("fit_individually", (512, 64)),
+      ("exclusive_and_regular", (544, 32)),
+  )
+  def test_tmem_multiple_allocs_are_limited_to_512_cols(self, num_cols):
+    def kernel(ctx, input, output, scratch):
+      del ctx, input, output, scratch
+
+    x = jnp.zeros((128, 128), dtype=jnp.float32)
+    with self.assertRaisesRegex(ValueError, "limit of 512"):
+      mgpu.as_gpu_kernel(
+          kernel, (1, 1, 1), (128, 1, 1), x, x,
+          [mgpu.TMEM((128, n), jnp.float32) for n in num_cols],
+      )(x).block_until_ready()
+
+  def test_tmem_alloc_more_than_512_cols_requires_sm107f(self):
+    if jtu.is_sm107f():
+      self.skipTest("sm_107f supports allocating more than 512 columns.")
+
+    def kernel(ctx, input, output, scratch):
+      del ctx, input, output, scratch
+
+    x = jnp.zeros((128, 128), dtype=jnp.float32)
+    with self.assertRaisesRegex(ValueError, "exceeding the limit of 512"):
+      mgpu.as_gpu_kernel(
+          kernel, (1, 1, 1), (128, 1, 1), x, x,
+          mgpu.TMEM((128, 576), jnp.float32),
+      )(x).block_until_ready()
+
   @parameterized.parameters([
       (jnp.float32, 1, tcgen05.LAYOUT),
       (jnp.float16, 1, tcgen05.LAYOUT),
@@ -2596,11 +2672,7 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
       )
     a_gpu_scales, b_gpu_scales = map(format_scales, (a_scales, b_scales))
     args = (x, y, a_gpu_scales, b_gpu_scales)
-    is_sm107f = (
-        jtu.is_cuda_compute_capability_at_least("10.7")
-        and not jtu.is_cuda_compute_capability_at_least("11.0")
-    )
-    if scale_jax_dtype == dtypes.float8_e5m3fnu and not is_sm107f:
+    if scale_jax_dtype == dtypes.float8_e5m3fnu and not jtu.is_sm107f():
       with self.assertRaisesRegex(
           ValueError, r"E5M3FNU scale factors are only supported on sm_107f"
       ):
@@ -2611,7 +2683,7 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
     if (
         scale_jax_dtype == jnp.float8_e4m3fn
         and block_size == 32
-        and not is_sm107f
+        and not jtu.is_sm107f()
     ):
       with self.assertRaisesRegex(ValueError, "Scale block size mismatch"):
         mgpu.as_gpu_kernel(
@@ -2809,12 +2881,8 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
   def test_mma_block_scaled_collective(
       self, m, n, scale_jax_dtype, block_size, lhs_in_tmem
   ):
-    if (
-        scale_jax_dtype == jnp.float8_e4m3fn
-        and block_size != 16
-        and not jtu.is_cuda_compute_capability_equal("10.7")
-    ):
-      self.skipTest("e4m3fn scale with block size != 16 requires sm107a.")
+    if scale_jax_dtype == jnp.float8_e4m3fn and block_size != 16:
+      self.skip_unless_sm107f()
     in_jax_dtype = jnp.float4_e2m1fn
     out_jax_dtype = jnp.float32
     scale_block = block_size
@@ -3484,12 +3552,8 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
   def test_mma_block_scaled_sparse_f4(
       self, m, n, in_jax_dtype, scale_jax_dtype, base_block_size, swizzle
   ):
-    if (
-        scale_jax_dtype == jnp.float8_e4m3fn
-        and base_block_size != 16
-        and not jtu.is_cuda_compute_capability_equal("10.7")
-    ):
-      self.skipTest("e4m3fn scale with block size != 16 requires sm107a.")
+    if scale_jax_dtype == jnp.float8_e4m3fn and base_block_size != 16:
+      self.skip_unless_sm107f()
     out_jax_dtype = jnp.float32
     sparse_meta_dtype = jnp.uint2
     block_size = base_block_size * 2
@@ -3906,10 +3970,7 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
         mgpu.ClusterBarrier(collective_dims=(gpu.Dimension.x,)) if collective else (),
         mgpu.TMEM((block_tile, mn), out_dtype, collective=collective),
     ]
-    if not (
-        jtu.is_cuda_compute_capability_at_least("10.7")
-        and not jtu.is_cuda_compute_capability_at_least("11.0")
-    ):
+    if not jtu.is_sm107f():
       with self.assertRaisesRegex(
           NotImplementedError,
           "SMEM-read-only commit for operand A requires sm_107f",
@@ -5596,7 +5657,7 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
     np.testing.assert_array_equal(kernel(x), jnp.stack([x, x], axis=0))
 
 
-class FragmentedArrayTest(TestCase):
+class FragmentedArrayTest(TestCase, jtu.CudaArchSpecificTest):
 
   @parameterized.product(
       op=(
@@ -5819,12 +5880,8 @@ class FragmentedArrayTest(TestCase):
         jax_dtype_to,
     } and not jtu.is_cuda_compute_capability_at_least("10.0"):
       self.skipTest("f8e8m0fnu not supported on pre-Blackwell GPUs")
-    is_sm107f = (
-        jtu.is_cuda_compute_capability_at_least("10.7")
-        and not jtu.is_cuda_compute_capability_at_least("11.0")
-    )
-    if dtypes.float8_e5m3fnu in {jax_dtype_from, jax_dtype_to} and not is_sm107f:
-      self.skipTest("f8e5m3fnu only supported on sm_107f")
+    if dtypes.float8_e5m3fnu in {jax_dtype_from, jax_dtype_to}:
+      self.skip_unless_sm107f()
 
     # In this test we sample numerics from narrower type assuming they are
     # representable without rounding in the other type.
@@ -6058,11 +6115,7 @@ class FragmentedArrayTest(TestCase):
       )(values)
       np.testing.assert_array_equal(res, expected)
 
-    is_sm107f = (
-        jtu.is_cuda_compute_capability_at_least("10.7")
-        and not jtu.is_cuda_compute_capability_at_least("11.0")
-    )
-    if dst_dtype == dtypes.float8_e5m3fnu and not is_sm107f:
+    if dst_dtype == dtypes.float8_e5m3fnu and not jtu.is_sm107f():
       with self.assertRaisesRegex(
           ValueError, r"f8e5m3fnu type only supported on sm_107f GPUs"
       ):
@@ -6073,10 +6126,7 @@ class FragmentedArrayTest(TestCase):
 
     # f32/f16/bf16 -> f8e4m3fn/f8e5m2/f4e2m1fn (.rz) support added in PTX ISA
     # 9.4 (CUDA 13.4) on sm_107f. f8e5m3fnu supports .rz and .rp on sm_107f.
-    if (
-        jtu.is_cuda_compute_capability_equal("10.7")
-        and jtu.is_cuda_version_at_least(13, 4)
-    ):
+    if jtu.is_sm107f() and jtu.is_cuda_version_at_least(13, 4):
       uint_dtype = jnp.uint4 if dst_dtype == jnp.float4_e2m1fn else jnp.uint8
       rn_bits = expected_rn.view(uint_dtype)
       rounded_away = np.abs(expected_rn.astype(np.float32)) > np.abs(
@@ -7116,7 +7166,7 @@ class FragmentedArrayTest(TestCase):
     shape = (elems_per_thread * 128,)
     x = self.prng.integers(iinfo.min, iinfo.max + 1, shape, dtype=dtype)
     y = self.prng.integers(iinfo.min, iinfo.max + 1, shape, dtype=dtype)
-    if not jtu.is_cuda_compute_capability_equal("10.7"):
+    if not jtu.is_sm107f():
       with self.assertRaisesRegex(
           NotImplementedError,
           "Packed 8-bit integer ALU instructions require sm_107f",
@@ -9637,8 +9687,14 @@ class MosaicGpuDialectTCGen05Test(TestCase, jtu.JaxTestCase, jtu.CudaArchSpecifi
       ("unpacked", (128, 77), jnp.bfloat16, 1, False),
       ("packed", (128, 128), jnp.bfloat16, 2, False),
       ("collective", (128, 64), jnp.bfloat16, 1, True),
+      ("exclusive", (128, 544), jnp.float32, 1, False),
+      ("exclusive_packed", (128, 1088), jnp.bfloat16, 2, False),
+      ("exclusive_collective", (128, 576), jnp.float32, 1, True),
   )
   def test_tmem_alloc_dealloc(self, shape, dtype, packing, collective):
+    exclusive = shape[1] // packing > tcgen05.TMEM_MAX_COLS
+    if exclusive:
+      self.skip_unless_sm107f()
     tmem_type = ir.MemRefType.get(
         shape,
         utils.dtype_to_ir_type(dtype),
@@ -9672,21 +9728,23 @@ class MosaicGpuDialectTCGen05Test(TestCase, jtu.JaxTestCase, jtu.CudaArchSpecifi
           thread_semantics=mgpu.LoweringSemantics.Warpgroup,
       )()
     [alloc] = re.findall(
-        r"tcgen05.alloc.cta_group::([12]).sync.aligned.shared::cta.b32",
+        r"tcgen05.alloc(.exclusive)?.cta_group::([12]).sync.aligned.shared::cta.b32",
         ptx(),
     )
-    self.assertEqual(alloc[0], '2' if collective else '1')
+    self.assertEqual(alloc[0], ".exclusive" if exclusive else "")
+    self.assertEqual(alloc[1], '2' if collective else '1')
 
     [ld] = re.findall(
         r"ld.shared.b32\s+([%\w]+),\s+\[__dynamic_shmem__0\];",
         ptx(),
     )
     [dealloc] = re.findall(
-        r"tcgen05.dealloc.cta_group::([12]).sync.aligned.b32\s+([%\w]+),",
+        r"tcgen05.dealloc(.exclusive)?.cta_group::([12]).sync.aligned.b32\s+([%\w]+),",
         ptx(),
     )
-    self.assertEqual(dealloc[0], '2' if collective else '1')
-    self.assertEqual(dealloc[1], ld)
+    self.assertEqual(dealloc[0], ".exclusive" if exclusive else "")
+    self.assertEqual(dealloc[1], '2' if collective else '1')
+    self.assertEqual(dealloc[2], ld)
     [relinquish] = re.findall(
         r"tcgen05.relinquish_alloc_permit.cta_group::([12]).sync.aligned;",
         ptx(),
